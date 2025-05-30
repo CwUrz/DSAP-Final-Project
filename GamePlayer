@@ -45,6 +45,15 @@ private:
         }
         return Feis::PlayerActionType::None;
     }
+    Feis::PlayerActionType CombinerType(Feis::Direction d) const {
+        switch (d) {
+            case Feis::Direction::kLeft:   return Feis::PlayerActionType::BuildLeftOutCombiner;
+            case Feis::Direction::kTop:    return Feis::PlayerActionType::BuildTopOutCombiner;
+            case Feis::Direction::kRight:  return Feis::PlayerActionType::BuildRightOutCombiner;
+            case Feis::Direction::kBottom: return Feis::PlayerActionType::BuildBottomOutCombiner;
+        }
+        return Feis::PlayerActionType::None;
+    }
 
     inline int idx(Pos p) const { return p.row * W + p.col; }
 
