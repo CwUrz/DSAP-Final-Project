@@ -6,15 +6,6 @@
 #include <unordered_set>
 #include <utility>
 
-namespace std {
-    template <>
-    struct hash<std::pair<int, int>> {
-        size_t operator()(const std::pair<int, int>& p) const {
-            return hash<int>()(p.first) ^ (hash<int>()(p.second) << 1);
-        }
-    };
-}
-
 class GamePlayer final : public Feis::IGamePlayer {
 private:
     struct Action {
@@ -274,229 +265,7 @@ private:
 
         BuildConveyors(path, linkEnd, builtConveyors);
     }
-    
 
-
-    /*void ProcessCombiners(
-        const Feis::IGameInfo &info,
-        const std::vector<Pos> &cbmines,
-        std::vector<Pos>       &builtConveyors,
-        const std::vector<std::pair<Pos,Pos>> &centerEntrances) 
-    {
-        std::cout << "[Debug] Enter ProcessCombiners(), total mines = " << cbmines.size() << "\n";
-
-        // 用來記錄已建立 Combiner 的「第二個元素」（other）的數值，以及
-        // 該 Combiner 此側的輸送帶進入格子位置（entryCell），
-        // 以便未來遇到同值的 mine 可以直接銜接到這個 entryCell 而不用重建 Combiner。
-        std::unordered_map<int, Pos> entryCellBySecondVal;
-
-        //Helper 1：試圖把當前的 mine m 銜接到已存在的 Combiner 輸送帶。若成功回傳 true。
-        auto tryConnectToExisting = [&](const Pos &m) -> bool {
-            // 1.1. 取得 m 的數值
-            auto bgM = dynamic_cast<const Feis::NumberCell*>(
-                        info.GetLayeredCell(m).GetBackground().get());
-            if (!bgM) return false;
-            int valM = bgM->GetNumber();
-
-            // 1.2. 如果 entryCellBySecondVal 中有對應 valM 的 entry cell
-            auto it = entryCellBySecondVal.find(valM);
-            if (it == entryCellBySecondVal.end()) return false;
-
-            Pos entry = it->second;
-            // 1.3. 確認 entry 位置上已有輸送帶（builtConveyors 中）或前方可直接放 conveyor
-            bool hasConveyorAtEntry = false;
-            for (auto &cv : builtConveyors) {
-                if (cv == entry) {
-                    hasConveyorAtEntry = true;
-                    break;
-                }
-            }
-            if (!hasConveyorAtEntry) return false;
-
-            // 1.4. 從 m 到 entry 找最短路徑
-            auto path = bfsBetween(info, m, entry);
-            if (path.empty()) return false;
-
-            // 1.5. 鋪 conveyor 連接 m→entry
-            BuildConveyors(path, entry, builtConveyors);
-            return true;
-        };
-
-        // Helper 2：找 partner mine（other），使 (m + other) 可合成且距離 m 最近。若找不到回傳 false。
-        std::cout << "[Debug] Entering findPartner " << "\n";
-        auto findPartner = [&](const Pos &m, Pos &otherOut) -> bool {
-            auto bgM = dynamic_cast<const Feis::NumberCell*>(
-                        info.GetLayeredCell(m).GetBackground().get());
-            if (!bgM) return false;
-            int valM = bgM->GetNumber();
-
-            // 取得 collection center 中心座標，用來做距離排序
-            int top  = Feis::GameManager::CollectionCenterConfig::kTop;
-            int left = Feis::GameManager::CollectionCenterConfig::kLeft;
-            Pos center{
-                static_cast<int>(top + G/2),
-                static_cast<int>(left + G/2)
-            };
-
-            // 先找出所有可以合成（和 m 相加可得 ScoredProduct）的 other 列表
-            std::vector<std::pair<Pos,int>> candidates;
-            for (auto &p : cbmines) {
-                std::cout << "[Debug] Try mine (" << m.row << "," << m.col << ")\n";
-                if (p == m) continue;
-                auto bgO = dynamic_cast<const Feis::NumberCell*>(
-                            info.GetLayeredCell(p).GetBackground().get());
-                if (!bgO) continue;
-                int valO = bgO->GetNumber();
-                if (info.IsScoredProduct(valM + valO)) {
-                    // 計算 other 到 center 的曼哈頓距離，作為排序依據
-                    int d = std::abs(p.row - center.row) + std::abs(p.col - center.col);
-                    candidates.emplace_back(p, d);
-                }
-            }
-            if (candidates.empty()) return false;
-
-            // 按照距離中心的遠近，把離 center 較近的放前面
-            std::sort(candidates.begin(), candidates.end(),
-                    [](auto &a, auto &b){ return a.second < b.second; });
-            // 只取最靠近 center 的第一個當作 partner
-            otherOut = candidates.front().first;
-            return true;
-        };
-    
-
-        // Helper 3：嘗試在 (anchor, other) 之間找到一個可放 Combiner 的位置 combPos 與方向 combDir，
-        // 並同時回傳對應到 other 這邊的輸送帶「入口格子」 entryCellForOther。若無法擺放回傳 false。
-        auto findCombinerPlacement = [&](const Pos &anchor, const Pos &other,
-                                        Pos &combPos, Feis::Direction &combDir,
-                                        Pos &entryCellForOther) -> bool {
-            for (auto dAnchor : dirs) {
-                // combPos 候選：anchor 鄰格
-                Pos c = Feis::GetNeighborCellPosition(anchor, dAnchor);
-                if (!Feis::IsWithinBoard(c)) continue;
-                if (info.GetLayeredCell(c).GetForeground()) continue;// 該位置必須為空 (foreground == nullptr)
-
-                // → 這裡改用「inDir1 = dAnchor」，表示 Combiner 的「輸入一」(從 anchor 來的方向)
-                Feis::Direction inDir1 = dAnchor;
-
-                // 嘗試第二個輸入方向 dOther：c 的另一鄰格要與 other 連通
-                for (auto dOther : dirs) {
-                    //根据 combDir 直接计算“基准点”base（不再使用 MoveK）
-                    Pos base{-1, -1};
-                    std::vector<Feis::Direction> candidates; 
-
-                    switch (inDir1) {
-                        case Feis::Direction::kLeft:
-                            base = { c.row + 1, c.col };
-                            candidates = { Feis::Direction::kLeft, Feis::Direction::kTop, Feis::Direction::kBottom };
-                            break;
-
-                        case Feis::Direction::kTop:
-                            base = { c.row, c.col - 1 };
-                            candidates = { Feis::Direction::kLeft, Feis::Direction::kTop, Feis::Direction::kBottom };
-                            break;
-
-                        case Feis::Direction::kRight:
-                            base = { c.row - 1, c.col };
-                            candidates = { Feis::Direction::kLeft, Feis::Direction::kTop, Feis::Direction::kRight };
-                            break;
-
-                        case Feis::Direction::kBottom:
-                            base = { c.row, c.col + 1 };
-                            candidates = { Feis::Direction::kBottom, Feis::Direction::kTop, Feis::Direction::kRight };
-                            break;
-                    }
-                    if (!Feis::IsWithinBoard(base)) continue;
-
-                    // 定义一个 lambda 用来判断 candidate 是否能放在该格
-                    auto IsValidSecondInput = [&](const Feis::IGameInfo &info, Pos candidatePos) {
-                        if (!Feis::IsWithinBoard(candidatePos)) return false;
-                        // 如果前景存在，且不是 ConveyorCell，则非法
-                        if (auto fg = info.GetLayeredCell(candidatePos).GetForeground()) {
-                            if (!dynamic_cast<const Feis::ConveyorCell *>(fg.get())) {
-                                return false;
-                            }
-                        }
-                        // 如果背景是 NumberCell，则非法
-                        if (auto bg = info.GetLayeredCell(candidatePos).GetBackground()) {
-                            if (dynamic_cast<const Feis::NumberCell *>(bg.get())) {
-                                return false;
-                            }
-                        }
-                        return true;
-                    };
-
-                    Pos  input2{ -1, -1 };
-                    bool foundSecond = false;
-                    std::vector<Pos> pathToInput2;  // 保存从 other 到 secondInputPos 的 BFS 路径
-                    for (auto dOther : candidates) {
-                        // 先算出“基准点 base”在 dOther 方向上的邻格 candidate
-                        Pos candidate = Feis::GetNeighborCellPosition(base, dOther);
-                        if (!IsValidSecondInput(info, candidate)) {
-                            continue;
-                        }
-                        // 再检查 secondMine（other）是否能 BFS 到达这个 candidate
-                        auto tmpPath = bfsBetween(info, other, candidate);
-                        if (tmpPath.empty()) {
-                            continue;
-                        }
-
-                        // 如果走到这里，说明 candidate 同时满足“可放第二输入”且“other 能到达”
-                        input2 = candidate;
-                        pathToInput2   = std::move(tmpPath);
-                        foundSecond    = true;
-                        break;
-                    }
-                    if (!foundSecond) {
-                        continue;
-                    }
-                    // 到这里，input2 就是“第二输入格子”的坐标。
-                    std::cout << "[Debug]   findinput2 success: input2=(" << input2.row << "," << input2.col << ")" << "\n";
-                    // 找 output 方向 combDir
-                    Feis::Direction dOut = combDir;
-                    Pos exitCell = Feis::GetNeighborCellPosition(c, dOut);
-                    if (Feis::IsWithinBoard(exitCell) &&
-                        !info.GetLayeredCell(exitCell).GetForeground()) {
-                        // 这里 exitCell 就是合法的合流器输出端格子
-                        actions_.push_back({ MachineType(inDir1), anchor });
-
-                        // —— 2) 在 “other” 处放采矿机，让第二矿井的矿石朝向 secondInputPos 流出 
-                        //铺 “other → secondInputPos” 这一段 Conveyor
-                        {
-                            Pos firstStep = pathToInput2[0];
-                            Feis::Direction dir0 = Feis::Direction::kLeft;
-                            if      (firstStep.row == other.row && firstStep.col == other.col + 1) dir0 = Feis::Direction::kRight;
-                            else if (firstStep.row == other.row && firstStep.col == other.col - 1) dir0 = Feis::Direction::kLeft;
-                            else if (firstStep.col == other.col && firstStep.row == other.row + 1) dir0 = Feis::Direction::kBottom;
-                            else if (firstStep.col == other.col && firstStep.row == other.row - 1) dir0 = Feis::Direction::kTop;
-                            actions_.push_back({ MachineType(dir0), other });
-                            BuildConveyors(pathToInput2, input2, builtConveyors);
-                        }
-
-                        actions_.push_back({ CombinerType(combDir), combPos });
-
-                        // —— 4) 放 “Combiner → CollectionCenter” 這一段
-                        {
-                            Pos linkEndCenter;
-                            auto pathToCenter = FindNearestTarget(info, exitCell, builtConveyors, centerEntrances, linkEndCenter);
-                            if (!pathToCenter.empty()) {
-                                BuildConveyors(pathToCenter, linkEndCenter, builtConveyors);
-                            }
-                        }
-
-                    } else {
-                        // 如果 exitCell 越界或被占，说明此 Combiner 放法不行，需要换位置或换方向
-                        continue;  // 举例：跳过当前这一对锚点
-                    }
-                    // 找到可用的 combPos、combDir、以及 entryCellForOther
-                    combPos = c;
-                    combDir = dOut;
-                    entryCellForOther = input2;
-                    return true;
-                }
-            }
-            return false;
-        };
-    };*/
     struct PairHash {
         std::size_t operator()(const std::pair<int, int>& p) const {
             return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 1);
@@ -518,7 +287,7 @@ private:
     std::unordered_map<int, Pos> entryCellBySecondVal;
     std::queue<Pos> q;
     for (const auto &m : cbmines) q.push(m);
-    std::unordered_set<std::pair<int, int>,PairHash> visited;
+    std::unordered_set<std::pair<int, int>, PairHash > visited;
 
     // Helper 1：tryConnectToExisting
     auto tryConnectToExisting = [&](const Pos &m) -> bool {
@@ -546,25 +315,25 @@ private:
         if (!bgM) return false;
         int valM = bgM->GetNumber();
 
-        int top = Feis::GameManager::CollectionCenterConfig::kTop;
-        int left = Feis::GameManager::CollectionCenterConfig::kLeft;
-        Pos center{ top + G/2, left + G/2 };
-
-        std::vector<std::pair<Pos,int>> candidates;
+        // 先找出所有可以合成（和 m 相加可得 ScoredProduct）的 other 列表
+        std::vector<Pos> candidates;
         for (auto &p : cbmines) {
-            if (p == m || visited.count(ToKey(p))) continue;
-            auto bgO = dynamic_cast<const Feis::NumberCell*>(info.GetLayeredCell(p).GetBackground().get());
+            //std::cout << "[Debug] Try mine (" << m.row << "," << m.col << ")\n";
+            if (p == m) continue;
+            auto bgO = dynamic_cast<const Feis::NumberCell*>(
+                        info.GetLayeredCell(p).GetBackground().get());
             if (!bgO) continue;
             int valO = bgO->GetNumber();
             if (info.IsScoredProduct(valM + valO)) {
-                int d = std::abs(p.row - center.row) + std::abs(p.col - center.col);
-                candidates.emplace_back(p, d);
+                candidates.push_back(p);
             }
+            if(candidates.size()>5) break;
         }
-
         if (candidates.empty()) return false;
-        std::sort(candidates.begin(), candidates.end(), [](auto &a, auto &b){ return a.second < b.second; });
-        otherOut = candidates.front().first;
+        // 按照距離中心的遠近，把離 center 較近的放前面
+        sortMines(candidates);
+        // 只取最靠近 center 的第一個當作 partner
+        otherOut = candidates.front();
         return true;
     };
 
@@ -641,6 +410,9 @@ private:
         return false;
     };
 
+    std::unordered_map<std::pair<int, int>, int, PairHash> retryCount;
+    int MAX_RETRY = 3;
+
     // Main Loop
     while (!q.empty()) {
         Pos m = q.front(); q.pop();
@@ -668,8 +440,15 @@ private:
                 entryCellBySecondVal[val] = entryCellForOther;
             }
         } else {
-            q.push(m);
+            retryCount[ToKey(m)]++;
+            if (retryCount[ToKey(m)] < MAX_RETRY) {
+                q.push(m);
+            } else {
+                //std::cout << "[Debug] Give up on mine at " << m.row << "," << m.col << "\n";
+                visited.insert(ToKey(m));  // 永久放棄這個礦
+            }
         }
+
     }
 }
 
