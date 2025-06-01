@@ -1,1 +1,305 @@
+    struct CombinerInfo {
+        Feis::CellPosition combPos;
+        Feis::Direction    combDir;
+        struct Entry {
+            Feis::CellPosition cell;         // 第二輸入口的座標
+            Feis::Direction    requiredDir;  // 從那格進 Combiner 要放哪個方向的 Machine/Conveyor
+        };
+        std::array<Entry,3> entries;
+    };
+
+    // ------------------------------------------------------------
+    // Helper 1：對「給定一顆礦 m」，找一個可以放 Combiner 的位置 (combPos/combDir)，
+    //         並且先把 Combiner→Center 的輸出路徑鋪好，最後回傳所有「candidate 候選礦」。
+    //  - 參數：m
+    //  - 回傳：若成功放置 Combiner，回傳 true，並填入 combPos、combDir、entryCellForOther，以及 candidates。
+    //    candidates 代表「所有跟 m 相加可以得分」的礦位置列表（不排序）。
+    //  - 流程：
+    //    1. 檢查 m 四周 2×2 區域是否都有空地方放 Combiner & 放未來的 conveyor。
+    //    2. 嘗試在 m 鄰格 (四面) 放 Combiner：確保 combPos 沒東西，且有一個 valid 的出口可以到 Center。
+    //    3. 如果放得下，就先在 combPos 放 Combiner，再把 Combiner→Center 的輸送帶 Build 起來。
+    //    4. 同時收集所有「cbmines 裡，跟 m 合併可以得分」的礦放到 candidates。
+    //    5. 只要有放下 Combiner，就回傳 true。
+    // ===== 改動後的 Helper 1：SetupCombinerForMine =====
+    bool SetupCombinerForMine(
+        const Feis::IGameInfo &info,
+        const Pos &m,
+        const std::vector<Pos> &cbmines,
+        const std::vector<std::pair<Pos,Pos>> &centerEntrances,
+        Pos &combPos,
+        Feis::Direction &combDir,
+        CombinerInfo &ci,
+        std::vector<Pos> &candidates,
+        std::vector<Pos> &builtConveyors
+    ) {
+        // 1) 先檢查 m 周圍 2×2 區域是否全為空 (foreground == nullptr)，才能放 Combiner
+        for (auto d : dirs) {
+            Pos adj = Feis::GetNeighborCellPosition(m, d);
+            if (!Feis::IsWithinBoard(adj)) return false;
+            if (info.GetLayeredCell(adj).GetForeground()) return false;
+        }
+
+        // 2) 嘗試在 m 四個鄰格放 Combiner
+        for (auto dAnchor : dirs) {
+            Pos c = Feis::GetNeighborCellPosition(m, dAnchor);
+            if (!Feis::IsWithinBoard(c)) continue;
+            if (info.GetLayeredCell(c).GetForeground()) continue; // Combiner 本體位置必須為空
+
+            // 在這裡放採礦機，把 m 這顆礦往 Combiner (c) 推
+            actions_.push_back({ MachineType(dAnchor), m });
+
+            // combDir 可以等於 dAnchor（代表 Combiner 放在 m 下方時，向下輸出）
+            // 或是任何其他方向，只要「出口格」能通到 centerEntrances
+            for (auto dOut : dirs) {
+                Pos exitCell = Feis::GetNeighborCellPosition(c, dOut);
+                if (!Feis::IsWithinBoard(exitCell)) continue;
+                if (info.GetLayeredCell(exitCell).GetForeground()) continue;
+
+                // 檢查「Combiner → Center」路徑是否存在
+                Pos linkEndCenter;
+                auto pathToCenter = FindNearestTarget(info, exitCell, builtConveyors, centerEntrances, linkEndCenter);
+                if (pathToCenter.empty()) continue;
+
+                // 只要找到一個合法的 dOut，就可以放 Combiner 並鋪好出口 Conveyor
+                actions_.push_back({ CombinerType(dOut), c });
+                BuildConveyors(pathToCenter, linkEndCenter, builtConveyors);
+
+                // 記錄 combPos、combDir，第二輸入口先設為 (-1,-1)，留給下一步決定
+                combPos = c;
+                combDir = dOut;
+                // 算出三個 entryCellForOther 以及對應 requiredDir
+                switch (dOut) {
+                    case Feis::Direction::kLeft:
+                        ci.entries[0] = { {c.row+1, c.col-1}, Feis::Direction::kRight  };
+                        ci.entries[1] = { {c.row+2, c.col}, Feis::Direction::kTop };
+                        ci.entries[2] = { {c.row+1, c.col+1},   Feis::Direction::Left };
+                        break;
+                    case Feis::Direction::kTop:
+                        ci.entries[0] = { {c.row+1, c.col-1}, Feis::Direction::kTop   };
+                        ci.entries[1] = { {c.row,   c.col-2},   Feis::Direction::kRight };
+                        ci.entries[2] = { {c.row+1, c.col-1}, Feis::Direction::kBottom };
+                        break;
+                    case Feis::Direction::kRight:
+                        ci.entries[0] = { {c.row-2, c.col  },   Feis::Direction::kBottom };
+                        ci.entries[1] = { {c.row-1, c.col-1}, Feis::Direction::kRight    };
+                        ci.entries[2] = { {c.row-1, c.col+1},   Feis::Direction::kLeft    };
+                        break;
+                    case Feis::Direction::kBottom:
+                        ci.entries[0] = { {c.row-1,   c.col+1}, Feis::Direction::kBottom  };
+                        ci.entries[1] = { {c.row , c.col+2},   Feis::Direction::kLeft};
+                        ci.entries[2] = { {c.row+1,   c.col+1}, Feis::Direction::kTop    };
+                        break;
+                    default:
+                        break;
+                }
+
+                // 收集所有「與 m 合併後可得分」的 cbmines
+                int valM = dynamic_cast<const Feis::NumberCell*>(
+                            info.GetLayeredCell(m).GetBackground().get()
+                        )->GetNumber();
+                for (auto &p : cbmines) {
+                    if (p == m) continue;
+                    auto bgO = dynamic_cast<const Feis::NumberCell*>(
+                                info.GetLayeredCell(p).GetBackground().get());
+                    if (!bgO) continue;
+                    int valO = bgO->GetNumber();
+                    if (info.IsScoredProduct(valM + valO)) {
+                        candidates.push_back(p);
+                    }
+                }
+                return true;
+            }
+        }
+
+        // 四個方向都試不到出口到 Center → 放不下 Combiner
+        return false;
+    }
+
+
+        // ------------------------------------------------------------
+    // Helper 2：嘗試把 candidate 連到「已存在的 Combiner 第二輸入口」entryCellForOther
+    // 名稱改為 TryConnectToExistingCombinerConveyer
+    //
+    // - 參數：
+    //     info                ：當前遊戲狀態
+    //     candidate           ：要送到 Combiner 的這顆礦
+    //     entryCellForOther   ：Combiner 的第二輸入口(若 Helper1 無法設定過，會是 {-1,-1})
+    //     builtConveyors      ：目前已鋪好的所有 Conveyor 位置
+    //
+    // - 流程：
+    //     1) 如果 entryCellForOther == {-1,-1} → return false (交給 Helper 3 建立新的 Conveyor)
+    //     2) 確認 builtConveyors 裡有這個 entryCellForOther → 如果沒有 → return false
+    //     3) 用 bfsBetween(candidate, entryCellForOther) 找最短路徑：
+    //            - 若路徑存在，就 BuildConveyors(path, entryCellForOther, builtConveyors) 並 return true
+    //            - 否則 return false
+    bool TryConnectToExistingCombinerConveyer(
+        const Feis::IGameInfo &info,
+        const Pos &candidate,
+        CombinerInfo &ci,
+        std::vector<Pos> &builtConveyors
+    ) {
+        for (const auto &entry : ci.entries) {
+            const Pos &entryCellForOther = entry.cell;
+            // 1) 確認 entryCellForOther 已經設定過
+            if (entryCellForOther.row < 0 || entryCellForOther.col < 0) {
+                return false;
+            }
+
+            // 2) 檢查 builtConveyors 中是否已有一格 Conveyor 在 entryCellForOther
+            bool hasExistingConveyor = false;
+            for (auto &cv : builtConveyors) {
+                if (cv == entryCellForOther) {
+                    hasExistingConveyor = true;
+                    break;
+                }
+            }
+            if (!hasExistingConveyor) {
+                // 入口格還沒鋪 Conveyor，就直接 return false，讓 Helper 3 去鋪
+                return false;
+            }
+
+            // 3) 嘗試 candidate → entryCellForOther 的 BFS 路徑
+            auto path = bfsBetween(info, candidate, entryCellForOther);
+            if (path.empty()) {
+                // 無法連通，讓 Helper 3 再來鋪一次
+                return false;
+            }
+
+            Pos firstStep = path[0];
+            Feis::Direction dir0 = Feis::Direction::kLeft;
+            if      (firstStep.col > candidate.col) dir0 = Feis::Direction::kRight;
+            else if (firstStep.col < candidate.col) dir0 = Feis::Direction::kLeft;
+            else if (firstStep.row > candidate.row) dir0 = Feis::Direction::kBottom;
+            else if (firstStep.row < candidate.row) dir0 = Feis::Direction::kTop;
+            actions_.push_back({ MachineType(dir0), candidate });
+
+            // 4) 成功找到路徑，BuildConveyors，將 candidate 推進 Combiner
+            BuildConveyors(path, entryCellForOther, builtConveyors);
+            return true;
+        }
+        return false;
+    }
+
+
+    // ------------------------------------------------------------
+    // Helper 3：給定 Combiner 放置位置 combPos，和「第二輸入口格子」 entryCellForOther（已經由 Helper 1 預先決定 Combiner 本體朝向）
+    //           從 candidates（所有可以和 m 合併的礦）裡面，找一個能從 candidate → entryCellForOther 有路徑。若找得到即回傳該 candidate 和 path。
+    bool FindValidCandidateForCombinerEntry(
+        const Feis::IGameInfo &info,
+        const Pos &combPos,
+        CombinerInfo &ci,
+        const std::vector<Pos> &candidates,
+        Pos &validCandidate,
+        std::vector<Pos> &pathToEntry
+    ) {
+        for (const auto &entry : ci.entries) {
+            const Pos &entryCellForOther = entry.cell;
+            for (auto &cand : candidates) {
+                // 檢查 cand 到 entryCellForOther 的 BFS 路徑是否存在
+                auto tmpPath = bfsBetween(info, cand, entryCellForOther);
+                if (!tmpPath.empty()) {
+                    validCandidate = cand;
+                    pathToEntry = std::move(tmpPath);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+  
+    void ProcessCombiners_Single(
+        const Feis::IGameInfo &info,
+        const std::vector<Pos> &cbmines,
+        std::vector<Pos> &builtConveyors,
+        const std::vector<std::pair<Pos,Pos>> &centerEntrances
+    ) {
+        if (cbmines.empty()) return;
+
+        auto ToKey = [&](const Pos& p) { return std::make_pair(p.row, p.col); };
+        std::unordered_set<std::pair<int,int>,PairHash> visited;
+
+        // 只要還有「未 visited」的礦，就繼續嘗試放 Combiner
+        while (true) {
+            bool progress = false;  // 這輪是否有放下新的 Combiner
+
+            // 1. 掃描所有尚未 visited 的礦 m
+            for (auto &m : cbmines) {
+                auto keyM = ToKey(m);
+                if (visited.count(keyM)) {
+                    // 已經處理過的礦跳過
+                    continue;
+                }
+
+                // 嘗試 Helper1：放 Combiner，並蒐集候選礦
+                CombinerInfo ci;
+                std::vector<Pos> candidates;
+                if (!SetupCombinerForMine(
+                        info, m, cbmines, centerEntrances,
+                        ci, candidates, builtConveyors))
+                {
+                    // 這顆 m 放不下 Combiner，就先標為 visited，等外層下一輪再判斷
+                    visited.insert(keyM);
+                    continue;
+                }
+
+                // 成功放下 Combiner ，標記並記錄進度
+                progress = true;
+                visited.insert(keyM);
+
+                // ============================
+                // 2. 接著處理這台新 Combiner 的三個 entryCell
+                //    先嘗試用 Helper2 去共用既有 Conveyor
+                bool connected = false;
+                for (auto &cand : candidates) {
+                    if (visited.count(ToKey(cand))) {
+                        // 如果已被其他 Combiner 處理過，也跳過
+                        continue;
+                    }
+                    if (TryConnectToExistingCombinerConveyer(info, cand, ci, builtConveyors)) {
+                        // 成功共用既有 Conveyor
+                        visited.insert(ToKey(cand));
+                        connected = true;
+                        break;
+                    }
+                }
+
+                // 3. 如果還沒共用到既有 Conveyor，就用 Helper3 幫這台 Combiner 找第一個 candidate → entryCell
+                if (!connected) {
+                    Pos validCandidate, chosenEntryCell;
+                    std::vector<Pos> pathToEntry;
+                    if (FindValidCandidateForCombinerEntry(
+                            info, ci, candidates,
+                            validCandidate, chosenEntryCell, pathToEntry))
+                    {
+                        // 3a) 放第二台 Machine，推 validCandidate 往 chosenEntryCell
+                        Pos firstStep = pathToEntry[0];
+                        Feis::Direction dir0 = Feis::Direction::kLeft;
+                        if      (firstStep.col > validCandidate.col) dir0 = Feis::Direction::kRight;
+                        else if (firstStep.col < validCandidate.col) dir0 = Feis::Direction::kLeft;
+                        else if (firstStep.row > validCandidate.row) dir0 = Feis::Direction::kBottom;
+                        else if (firstStep.row < validCandidate.row) dir0 = Feis::Direction::kTop;
+                        actions_.push_back({ MachineType(dir0), validCandidate });
+
+                        // 3b) 鋪 Conveyor：validCandidate → chosenEntryCell
+                        BuildConveyors(pathToEntry, chosenEntryCell, builtConveyors);
+
+                        visited.insert(ToKey(validCandidate));
+                    }
+                    // 如果 Helper3 也找不到，就代表這台 Combiner 只能吃 m 而無法接第二顆礦
+                }
+
+                // 既然這台 Combiner 已經放好，且 (可能) 也處理了第二顆礦
+                // 本輪對 m 已完成，直接跳到下一顆 m 繼續
+            }
+
+            // 4. 如果本輪沒有任何一顆礦成功放下 Combiner，表示所有剩下的都放不下
+            if (!progress) {
+                break;
+            }
+            // 否則本輪有放過至少一台 Combiner，就再回 while 繼續對新的 visited 狀態下剩餘礦做嘗試
+        }
+
+        // 5. 當退出 while 時，visited 裡面已經包含了
+    }
 
