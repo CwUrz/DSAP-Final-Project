@@ -1,34 +1,285 @@
-    struct CombinerInfo {
-        Feis::CellPosition combPos;
-        Feis::Direction    combDir;
-        struct Entry {
-            Feis::CellPosition cell;         // 第二輸入口的座標
-            Feis::Direction    requiredDir;  // 從那格進 Combiner 要放哪個方向的 Machine/Conveyor
-        };
-        std::array<Entry,3> entries;
+#include <functional>
+#include <vector>
+#include <queue>
+#include <algorithm>
+#include <climits>
+#include <unordered_set>
+#include <utility>
+
+class GamePlayer final : public Feis::IGamePlayer {
+private:
+    struct Action {
+        Feis::PlayerActionType type;
+        Feis::CellPosition       pos;
     };
 
+    std::vector<Action> actions_;
+    size_t              action_index_ = 0;
+    bool                initialized_  = false;
+
+    using Pos = Feis::CellPosition;
+    static constexpr int H = Feis::GameManagerConfig::kBoardHeight;
+    static constexpr int W = Feis::GameManagerConfig::kBoardWidth;
+    static constexpr std::size_t G = Feis::GameManagerConfig::kGoalSize;
+
+    inline static constexpr std::array<Feis::Direction,4> dirs = {
+        Feis::Direction::kLeft,
+        Feis::Direction::kTop,
+        Feis::Direction::kRight,
+        Feis::Direction::kBottom
+    };
+
+    Feis::PlayerActionType MachineType(Feis::Direction d) const {
+        switch (d) {
+            case Feis::Direction::kLeft:   return Feis::PlayerActionType::BuildLeftOutMiningMachine;
+            case Feis::Direction::kTop:    return Feis::PlayerActionType::BuildTopOutMiningMachine;
+            case Feis::Direction::kRight:  return Feis::PlayerActionType::BuildRightOutMiningMachine;
+            case Feis::Direction::kBottom: return Feis::PlayerActionType::BuildBottomOutMiningMachine;
+        }
+        return Feis::PlayerActionType::None;
+    }
+    Feis::PlayerActionType ConveyorType(Feis::Direction d) const {
+        switch (d) {
+            case Feis::Direction::kLeft:   return Feis::PlayerActionType::BuildRightToLeftConveyor;
+            case Feis::Direction::kTop:    return Feis::PlayerActionType::BuildBottomToTopConveyor;
+            case Feis::Direction::kRight:  return Feis::PlayerActionType::BuildLeftToRightConveyor;
+            case Feis::Direction::kBottom: return Feis::PlayerActionType::BuildTopToBottomConveyor;
+        }
+        return Feis::PlayerActionType::None;
+    }
+    Feis::PlayerActionType CombinerType(Feis::Direction d) const {
+        switch (d) {
+            case Feis::Direction::kLeft:   return Feis::PlayerActionType::BuildLeftOutCombiner;
+            case Feis::Direction::kTop:    return Feis::PlayerActionType::BuildTopOutCombiner;
+            case Feis::Direction::kRight:  return Feis::PlayerActionType::BuildRightOutCombiner;
+            case Feis::Direction::kBottom: return Feis::PlayerActionType::BuildBottomOutCombiner;
+        }
+        return Feis::PlayerActionType::None;
+    }
+
+    Feis::Direction OppositeDirection(Feis::Direction d) const {
+        switch (d) {
+            case Feis::Direction::kTop:    return Feis::Direction::kBottom;
+            case Feis::Direction::kBottom: return Feis::Direction::kTop;
+            case Feis::Direction::kLeft:   return Feis::Direction::kRight;
+            case Feis::Direction::kRight:  return Feis::Direction::kLeft;
+        }
+        return d;
+    }
+
+    inline int idx(Pos p) const { return p.row * W + p.col; }
+
+    // 1) 收集所有中心入口
+    std::vector<std::pair<Pos,Pos>> GetCenterEntrances(const Feis::IGameInfo& info) {
+        std::vector<std::pair<Pos,Pos>> centerEntrances;
+        int top  = Feis::GameManager::CollectionCenterConfig::kTop;
+        int left = Feis::GameManager::CollectionCenterConfig::kLeft;
+        for (int r = top; r < top + G; ++r) {
+            for (int c = left; c < left + G; ++c) {
+                Pos cc{r, c};
+                for (auto d : dirs) {
+                    Pos nb = Feis::GetNeighborCellPosition(cc, d);
+                    if (Feis::IsWithinBoard(nb) && !info.GetLayeredCell(nb).GetForeground()) {
+                        centerEntrances.emplace_back(nb, cc);
+                    }
+                }
+            }
+        }
+        std::sort(centerEntrances.begin(), centerEntrances.end(),
+                  [](const auto &a, const auto &b){
+                      if (a.first.row != b.first.row)
+                          return a.first.row < b.first.row;
+                      return a.first.col < b.first.col;
+                  });
+        centerEntrances.erase(
+            std::unique(centerEntrances.begin(), centerEntrances.end(),
+                        [](const auto &a, const auto &b){ return a.first == b.first; }),
+            centerEntrances.end());
+        return centerEntrances;
+    }
+
+    void sortMines(std::vector<Pos>& mines) {
+        int top  = Feis::GameManager::CollectionCenterConfig::kTop;
+        int left = Feis::GameManager::CollectionCenterConfig::kLeft;
+        Pos center{ static_cast<int>( top + G/2), static_cast<int>( left + G/2) };
+        std::sort(mines.begin(), mines.end(),
+        [&](const Pos &a, const Pos &b){
+            int da = std::abs(a.row-center.row) + std::abs(a.col-center.col);
+            int db = std::abs(b.row-center.row) + std::abs(b.col-center.col);
+            return da < db;
+        });
+    }
+
+    std::vector<Pos> GetScoredMines(const Feis::IGameInfo& info, std::vector<Pos>& cbmines) {
+        std::vector<Pos> mines;
+        for (int r = 0; r < H; ++r) {
+            for (int c = 0; c < W; ++c) {
+                Pos p{r,c};
+                if (auto bg = info.GetLayeredCell(p).GetBackground()) {
+                    if (auto num = dynamic_cast<const Feis::NumberCell*>(bg.get())) {
+                        if (info.IsScoredProduct(num->GetNumber()))
+                            mines.push_back(p);
+                        else
+                            cbmines.push_back(p);
+                    }
+                }
+            }
+        }
+        sortMines(mines);
+        sortMines(cbmines);
+        return mines;
+    }
+
+    std::vector<Pos> bfsBetween(const Feis::IGameInfo& info, Pos src, Pos dst) {
+        std::vector<int> dist(H*W, -1);
+        std::vector<Pos> prev(H*W);
+        std::queue<Pos>  q;
+        dist[idx(src)] = 0; prev[idx(src)] = src; q.push(src);
+
+        while (!q.empty()) {
+            Pos u = q.front(); q.pop();
+            if (u == dst) break;
+            for (auto d : dirs) {
+                Pos v = Feis::GetNeighborCellPosition(u, d);
+                if (!Feis::IsWithinBoard(v) || dist[idx(v)] >= 0) continue;
+                if (auto fg = info.GetLayeredCell(v).GetForeground())
+                    if (!dynamic_cast<const Feis::ConveyorCell*>(fg.get()))
+                        continue;
+                if (auto bg = info.GetLayeredCell(v).GetBackground())
+                    if (dynamic_cast<const Feis::NumberCell*>(bg.get()))
+                        continue;
+                dist[idx(v)] = dist[idx(u)] + 1;
+                prev[idx(v)] = u;
+                q.push(v);
+            }
+        }
+        if (dist[idx(dst)] < 0) return {};
+        std::vector<Pos> path;
+        for (Pos cur = dst; cur != src; cur = prev[idx(cur)])
+            path.push_back(cur);
+        std::reverse(path.begin(), path.end());
+        return path;
+    }
+
+    std::vector<Pos> FindNearestTarget(
+        const Feis::IGameInfo& info,
+        Pos m,
+        const std::vector<Pos>& builtConveyors,
+        const std::vector<std::pair<Pos, Pos>>& centerEntrances,
+        Pos& linkEnd
+    ) {
+        std::vector<int> dist(H*W, -1);
+        std::vector<Pos> prev(H*W);
+        std::queue<Pos>  q;
+        dist[idx(m)] = 0; prev[idx(m)] = m; q.push(m);
+
+        Pos convPos{-1,-1}, cenPos{-1,-1}, cenCenter{-1,-1};
+        bool foundConv=false, foundCen=false;
+
+        while (!q.empty() && (!foundConv || !foundCen)) {
+            Pos u = q.front(); q.pop();
+            int dcur = dist[idx(u)];
+            // check conveyor
+            if (!foundConv) {
+                bool isConv = false;
+                if (auto fg = info.GetLayeredCell(u).GetForeground())
+                    if (dynamic_cast<const Feis::ConveyorCell*>(fg.get()))
+                        isConv = true;
+                for (auto &bc: builtConveyors)
+                    if (bc == u) { isConv = true; break; }
+                if (isConv) { convPos = u; foundConv = true; }
+            }
+            // check centerEntrance
+            if (!foundCen) {
+                for (auto &tp : centerEntrances) {
+                    if (tp.first == u) {
+                        cenPos = u;
+                        cenCenter = tp.second;
+                        foundCen = true;
+                        break;
+                    }
+                }
+            }
+            if (foundConv && foundCen) break;
+            // extend
+            for (auto d : dirs) {
+                Pos v = Feis::GetNeighborCellPosition(u, d);
+                if (!Feis::IsWithinBoard(v) || dist[idx(v)] >= 0) continue;
+                if (auto fg2 = info.GetLayeredCell(v).GetForeground())
+                    if (!dynamic_cast<const Feis::ConveyorCell*>(fg2.get()))
+                        continue;
+                if (auto bg2 = info.GetLayeredCell(v).GetBackground())
+                    if (dynamic_cast<const Feis::NumberCell*>(bg2.get()))
+                        continue;
+                dist[idx(v)] = dcur + 1;
+                prev[idx(v)] = u;
+                q.push(v);
+            }
+        }
+
+        int dConv = foundConv ? dist[idx(convPos)] : INT_MAX;
+        int dCen  = foundCen  ? dist[idx(cenPos)]  : INT_MAX;
+        bool useConv = (dConv <= dCen);
+        Pos endPos  = useConv ? convPos : cenPos;
+        linkEnd = useConv ? convPos : cenCenter;
+        if (endPos.row < 0) return {m};
+
+        // path
+        std::vector<Pos> path;
+        for (Pos cur = endPos; cur != m; cur = prev[idx(cur)])
+            path.push_back(cur);
+        std::reverse(path.begin(), path.end());
+        if (path.empty()) return {m};
+        return path;
+    }
+
+    void BuildConveyors(const std::vector<Pos>& path, Pos linkEnd, std::vector<Pos>& builtConveyors) {
+        for (size_t i = 0; i < path.size(); ++i) {
+            Pos src = path[i];
+            Pos dst = (i + 1 < path.size()) ? path[i + 1] : linkEnd;
+            Feis::Direction di = dirs[0];
+            for (auto d : dirs) {
+                if (Feis::GetNeighborCellPosition(src, d) == dst) {
+                    di = d;
+                    break;
+                }
+            }
+            actions_.push_back({ ConveyorType(di), src });
+            builtConveyors.push_back(src);
+        }
+    }
+
+    void ProcessMine(const Feis::IGameInfo& info, Pos m,
+                    std::vector<Pos>& builtConveyors,
+                    const std::vector<std::pair<Pos,Pos>>& centerEntrances)
+    {
+        Pos linkEnd;
+        auto path = FindNearestTarget(info, m, builtConveyors, centerEntrances, linkEnd);
+        // build machine
+        Feis::Direction d0 = dirs[0];
+        for (auto d : dirs) {
+            if (Feis::GetNeighborCellPosition(m, d) == path[0]) { d0 = d; break; }
+        }
+        actions_.push_back({ MachineType(d0), m });
+        if (path.size() == 1) return;
+        BuildConveyors(path, linkEnd, builtConveyors);
+    }
+
+    struct PairHash {
+        std::size_t operator()(const std::pair<int, int>& p) const {
+            return std::hash<int>()(p.first) ^ (std::hash<int>()(p.second) << 1);
+        }
+    };
+
+
     // ------------------------------------------------------------
-    // Helper 1：對「給定一顆礦 m」，找一個可以放 Combiner 的位置 (combPos/combDir)，
-    //         並且先把 Combiner→Center 的輸出路徑鋪好，最後回傳所有「candidate 候選礦」。
-    //  - 參數：m
-    //  - 回傳：若成功放置 Combiner，回傳 true，並填入 combPos、combDir、entryCellForOther，以及 candidates。
-    //    candidates 代表「所有跟 m 相加可以得分」的礦位置列表（不排序）。
-    //  - 流程：
-    //    1. 檢查 m 四周 2×2 區域是否都有空地方放 Combiner & 放未來的 conveyor。
-    //    2. 嘗試在 m 鄰格 (四面) 放 Combiner：確保 combPos 沒東西，且有一個 valid 的出口可以到 Center。
-    //    3. 如果放得下，就先在 combPos 放 Combiner，再把 Combiner→Center 的輸送帶 Build 起來。
-    //    4. 同時收集所有「cbmines 裡，跟 m 合併可以得分」的礦放到 candidates。
-    //    5. 只要有放下 Combiner，就回傳 true。
-    // ===== 改動後的 Helper 1：SetupCombinerForMine =====
+    // Helper 1：放 Combiner，並蒐集候選礦
     bool SetupCombinerForMine(
         const Feis::IGameInfo &info,
         const Pos &m,
         const std::vector<Pos> &cbmines,
         const std::vector<std::pair<Pos,Pos>> &centerEntrances,
-        Pos &combPos,
-        Feis::Direction &combDir,
-        CombinerInfo &ci,
+        Pos &entryCellForOther,
         std::vector<Pos> &candidates,
         std::vector<Pos> &builtConveyors
     ) {
@@ -48,8 +299,10 @@
             // 在這裡放採礦機，把 m 這顆礦往 Combiner (c) 推
             actions_.push_back({ MachineType(dAnchor), m });
 
-            // combDir 可以等於 dAnchor（代表 Combiner 放在 m 下方時，向下輸出）
-            // 或是任何其他方向，只要「出口格」能通到 centerEntrances
+            // combPos, combDir 在這裡當作內部變數使用
+            Pos combPos = c;
+            Feis::Direction combDirLocal = dAnchor; // 預設一個值，稍後再改
+
             for (auto dOut : dirs) {
                 Pos exitCell = Feis::GetNeighborCellPosition(c, dOut);
                 if (!Feis::IsWithinBoard(exitCell)) continue;
@@ -61,33 +314,23 @@
                 if (pathToCenter.empty()) continue;
 
                 // 只要找到一個合法的 dOut，就可以放 Combiner 並鋪好出口 Conveyor
+                combDirLocal = dOut;
                 actions_.push_back({ CombinerType(dOut), c });
                 BuildConveyors(pathToCenter, linkEndCenter, builtConveyors);
 
-                // 記錄 combPos、combDir，第二輸入口先設為 (-1,-1)，留給下一步決定
-                combPos = c;
-                combDir = dOut;
-                // 算出三個 entryCellForOther 以及對應 requiredDir
+                // 記錄 entryCellForOther
                 switch (dOut) {
                     case Feis::Direction::kLeft:
-                        ci.entries[0] = { {c.row+1, c.col-1}, Feis::Direction::kRight  };
-                        ci.entries[1] = { {c.row+2, c.col}, Feis::Direction::kTop };
-                        ci.entries[2] = { {c.row+1, c.col+1},   Feis::Direction::Left };
+                        entryCellForOther = { c.row + 1, c.col + 1 };
                         break;
                     case Feis::Direction::kTop:
-                        ci.entries[0] = { {c.row+1, c.col-1}, Feis::Direction::kTop   };
-                        ci.entries[1] = { {c.row,   c.col-2},   Feis::Direction::kRight };
-                        ci.entries[2] = { {c.row+1, c.col-1}, Feis::Direction::kBottom };
+                        entryCellForOther = { c.row + 1, c.col - 1 };
                         break;
                     case Feis::Direction::kRight:
-                        ci.entries[0] = { {c.row-2, c.col  },   Feis::Direction::kBottom };
-                        ci.entries[1] = { {c.row-1, c.col-1}, Feis::Direction::kRight    };
-                        ci.entries[2] = { {c.row-1, c.col+1},   Feis::Direction::kLeft    };
+                        entryCellForOther = { c.row - 1, c.col - 1 };
                         break;
                     case Feis::Direction::kBottom:
-                        ci.entries[0] = { {c.row-1,   c.col+1}, Feis::Direction::kBottom  };
-                        ci.entries[1] = { {c.row , c.col+2},   Feis::Direction::kLeft};
-                        ci.entries[2] = { {c.row+1,   c.col+1}, Feis::Direction::kTop    };
+                        entryCellForOther = { c.row - 1, c.col + 1 };
                         break;
                     default:
                         break;
@@ -95,8 +338,8 @@
 
                 // 收集所有「與 m 合併後可得分」的 cbmines
                 int valM = dynamic_cast<const Feis::NumberCell*>(
-                            info.GetLayeredCell(m).GetBackground().get()
-                        )->GetNumber();
+                                info.GetLayeredCell(m).GetBackground().get()
+                            )->GetNumber();
                 for (auto &p : cbmines) {
                     if (p == m) continue;
                     auto bgO = dynamic_cast<const Feis::NumberCell*>(
@@ -115,100 +358,73 @@
         return false;
     }
 
-
-        // ------------------------------------------------------------
-    // Helper 2：嘗試把 candidate 連到「已存在的 Combiner 第二輸入口」entryCellForOther
-    // 名稱改為 TryConnectToExistingCombinerConveyer
-    //
-    // - 參數：
-    //     info                ：當前遊戲狀態
-    //     candidate           ：要送到 Combiner 的這顆礦
-    //     entryCellForOther   ：Combiner 的第二輸入口(若 Helper1 無法設定過，會是 {-1,-1})
-    //     builtConveyors      ：目前已鋪好的所有 Conveyor 位置
-    //
-    // - 流程：
-    //     1) 如果 entryCellForOther == {-1,-1} → return false (交給 Helper 3 建立新的 Conveyor)
-    //     2) 確認 builtConveyors 裡有這個 entryCellForOther → 如果沒有 → return false
-    //     3) 用 bfsBetween(candidate, entryCellForOther) 找最短路徑：
-    //            - 若路徑存在，就 BuildConveyors(path, entryCellForOther, builtConveyors) 並 return true
-    //            - 否則 return false
+    // Helper 2：嘗試把第二顆礦接到已存在的 Conveyor
     bool TryConnectToExistingCombinerConveyer(
         const Feis::IGameInfo &info,
         const Pos &candidate,
-        CombinerInfo &ci,
+        const Pos &entryCellForOther,
         std::vector<Pos> &builtConveyors
     ) {
-        for (const auto &entry : ci.entries) {
-            const Pos &entryCellForOther = entry.cell;
-            // 1) 確認 entryCellForOther 已經設定過
-            if (entryCellForOther.row < 0 || entryCellForOther.col < 0) {
-                return false;
-            }
-
-            // 2) 檢查 builtConveyors 中是否已有一格 Conveyor 在 entryCellForOther
-            bool hasExistingConveyor = false;
-            for (auto &cv : builtConveyors) {
-                if (cv == entryCellForOther) {
-                    hasExistingConveyor = true;
-                    break;
-                }
-            }
-            if (!hasExistingConveyor) {
-                // 入口格還沒鋪 Conveyor，就直接 return false，讓 Helper 3 去鋪
-                return false;
-            }
-
-            // 3) 嘗試 candidate → entryCellForOther 的 BFS 路徑
-            auto path = bfsBetween(info, candidate, entryCellForOther);
-            if (path.empty()) {
-                // 無法連通，讓 Helper 3 再來鋪一次
-                return false;
-            }
-
-            Pos firstStep = path[0];
-            Feis::Direction dir0 = Feis::Direction::kLeft;
-            if      (firstStep.col > candidate.col) dir0 = Feis::Direction::kRight;
-            else if (firstStep.col < candidate.col) dir0 = Feis::Direction::kLeft;
-            else if (firstStep.row > candidate.row) dir0 = Feis::Direction::kBottom;
-            else if (firstStep.row < candidate.row) dir0 = Feis::Direction::kTop;
-            actions_.push_back({ MachineType(dir0), candidate });
-
-            // 4) 成功找到路徑，BuildConveyors，將 candidate 推進 Combiner
-            BuildConveyors(path, entryCellForOther, builtConveyors);
-            return true;
+        // 1) 確認 entryCellForOther 已經設定過
+        if (entryCellForOther.row < 0 || entryCellForOther.col < 0) {
+            return false;
         }
-        return false;
+
+        // 2) 檢查 builtConveyors 中是否已有一格 Conveyor 在 entryCellForOther
+        bool hasExistingConveyor = false;
+        for (auto &cv : builtConveyors) {
+            if (cv == entryCellForOther) {
+                hasExistingConveyor = true;
+                break;
+            }
+        }
+        if (!hasExistingConveyor) {
+            // 入口格還沒鋪 Conveyor，就直接 return false，讓 Helper 3 去鋪
+            return false;
+        }
+
+        // 3) 嘗試 candidate → entryCellForOther 的 BFS 路徑
+        auto path = bfsBetween(info, candidate, entryCellForOther);
+        if (path.empty()) {
+            // 無法連通，讓 Helper 3 再來鋪一次
+            return false;
+        }
+
+        // 推動第二台採礦機把 candidate 推入 Combiner
+        Pos firstStep = path[0];
+        Feis::Direction dir0 = Feis::Direction::kLeft;
+        if      (firstStep.col > candidate.col) dir0 = Feis::Direction::kRight;
+        else if (firstStep.col < candidate.col) dir0 = Feis::Direction::kLeft;
+        else if (firstStep.row > candidate.row) dir0 = Feis::Direction::kBottom;
+        else if (firstStep.row < candidate.row) dir0 = Feis::Direction::kTop;
+        actions_.push_back({ MachineType(dir0), candidate });
+
+        // 4) 成功找到路徑，BuildConveyors，將 candidate 推進 Combiner
+        BuildConveyors(path, entryCellForOther, builtConveyors);
+        return true;
     }
 
-
-    // ------------------------------------------------------------
-    // Helper 3：給定 Combiner 放置位置 combPos，和「第二輸入口格子」 entryCellForOther（已經由 Helper 1 預先決定 Combiner 本體朝向）
-    //           從 candidates（所有可以和 m 合併的礦）裡面，找一個能從 candidate → entryCellForOther 有路徑。若找得到即回傳該 candidate 和 path。
+    // Helper 3：給定 entryCellForOther，找一個可以從 candidate → entryCell 之路徑
     bool FindValidCandidateForCombinerEntry(
         const Feis::IGameInfo &info,
-        const Pos &combPos,
-        CombinerInfo &ci,
+        const Pos &entryCellForOther,
         const std::vector<Pos> &candidates,
         Pos &validCandidate,
         std::vector<Pos> &pathToEntry
     ) {
-        for (const auto &entry : ci.entries) {
-            const Pos &entryCellForOther = entry.cell;
-            for (auto &cand : candidates) {
-                // 檢查 cand 到 entryCellForOther 的 BFS 路徑是否存在
-                auto tmpPath = bfsBetween(info, cand, entryCellForOther);
-                if (!tmpPath.empty()) {
-                    validCandidate = cand;
-                    pathToEntry = std::move(tmpPath);
-                    return true;
-                }
+        for (auto &cand : candidates) {
+            // 檢查 cand 到 entryCellForOther 的 BFS 路徑是否存在
+            auto tmpPath = bfsBetween(info, cand, entryCellForOther);
+            if (!tmpPath.empty()) {
+                validCandidate = cand;
+                pathToEntry = std::move(tmpPath);
+                return true;
             }
         }
         return false;
     }
 
-  
-    void ProcessCombiners_Single(
+    void ProcessCombiners(
         const Feis::IGameInfo &info,
         const std::vector<Pos> &cbmines,
         std::vector<Pos> &builtConveyors,
@@ -232,23 +448,23 @@
                 }
 
                 // 嘗試 Helper1：放 Combiner，並蒐集候選礦
-                CombinerInfo ci;
+                Pos entryCellForOther;
                 std::vector<Pos> candidates;
                 if (!SetupCombinerForMine(
                         info, m, cbmines, centerEntrances,
-                        ci, candidates, builtConveyors))
+                        entryCellForOther, candidates, builtConveyors))
                 {
-                    // 這顆 m 放不下 Combiner，就先標為 visited，等外層下一輪再判斷
+                    // 這顆 m 放不下 Combiner，就先標為 visited
                     visited.insert(keyM);
                     continue;
                 }
 
-                // 成功放下 Combiner ，標記並記錄進度
+                // 成功放下 Combiner，標記並記錄進度
                 progress = true;
                 visited.insert(keyM);
 
                 // ============================
-                // 2. 接著處理這台新 Combiner 的三個 entryCell
+                // 2. 接著處理這台新 Combiner 的 otherentryCell
                 //    先嘗試用 Helper2 去共用既有 Conveyor
                 bool connected = false;
                 for (auto &cand : candidates) {
@@ -256,7 +472,7 @@
                         // 如果已被其他 Combiner 處理過，也跳過
                         continue;
                     }
-                    if (TryConnectToExistingCombinerConveyer(info, cand, ci, builtConveyors)) {
+                    if (TryConnectToExistingCombinerConveyer(info, cand, entryCellForOther, builtConveyors)) {
                         // 成功共用既有 Conveyor
                         visited.insert(ToKey(cand));
                         connected = true;
@@ -266,13 +482,13 @@
 
                 // 3. 如果還沒共用到既有 Conveyor，就用 Helper3 幫這台 Combiner 找第一個 candidate → entryCell
                 if (!connected) {
-                    Pos validCandidate, chosenEntryCell;
+                    Pos validCandidate;
                     std::vector<Pos> pathToEntry;
                     if (FindValidCandidateForCombinerEntry(
-                            info, ci, candidates,
-                            validCandidate, chosenEntryCell, pathToEntry))
+                            info, entryCellForOther, candidates,
+                            validCandidate, pathToEntry))
                     {
-                        // 3a) 放第二台 Machine，推 validCandidate 往 chosenEntryCell
+                        // 3a) 放第二台 Machine，推 validCandidate 往 entryCellForOther
                         Pos firstStep = pathToEntry[0];
                         Feis::Direction dir0 = Feis::Direction::kLeft;
                         if      (firstStep.col > validCandidate.col) dir0 = Feis::Direction::kRight;
@@ -281,14 +497,13 @@
                         else if (firstStep.row < validCandidate.row) dir0 = Feis::Direction::kTop;
                         actions_.push_back({ MachineType(dir0), validCandidate });
 
-                        // 3b) 鋪 Conveyor：validCandidate → chosenEntryCell
-                        BuildConveyors(pathToEntry, chosenEntryCell, builtConveyors);
+                        // 3b) 鋪 Conveyor：validCandidate → entryCellForOther
+                        BuildConveyors(pathToEntry, entryCellForOther, builtConveyors);
 
                         visited.insert(ToKey(validCandidate));
                     }
                     // 如果 Helper3 也找不到，就代表這台 Combiner 只能吃 m 而無法接第二顆礦
                 }
-
                 // 既然這台 Combiner 已經放好，且 (可能) 也處理了第二顆礦
                 // 本輪對 m 已完成，直接跳到下一顆 m 繼續
             }
@@ -299,7 +514,37 @@
             }
             // 否則本輪有放過至少一台 Combiner，就再回 while 繼續對新的 visited 狀態下剩餘礦做嘗試
         }
-
-        // 5. 當退出 while 時，visited 裡面已經包含了
     }
+
+    void initialize(const Feis::IGameInfo &info) {
+        auto centerEntrances = GetCenterEntrances(info);
+
+        std::vector<Pos> cbmines;
+        auto mines = GetScoredMines(info, cbmines);
+
+        // 先記下 actions_ 的初始大小
+        size_t beforeSize = actions_.size();
+
+        std::vector<Pos> builtConveyors;
+        for (auto m : mines) {
+            ProcessMine(info, m, builtConveyors, centerEntrances);
+        }
+        if (actions_.size() == beforeSize) {
+            ProcessCombiners(info, cbmines, builtConveyors, centerEntrances);
+        }
+        initialized_ = true;
+    }
+
+public:
+    Feis::PlayerAction GetNextAction(const Feis::IGameInfo &info) override {
+        if (!initialized_) initialize(info);
+        if (action_index_ < actions_.size()) {
+            auto a = actions_[action_index_++];
+            return { a.type, a.pos };
+        }
+        return { Feis::PlayerActionType::None, {0,0} };
+    }
+
+    
+};
 
